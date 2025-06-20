@@ -54,3 +54,14 @@ impl Errno {
         }
     }
 }
+
+/// Errors that can occur during garbage collection and compaction.
+#[derive(Debug, Clone)]
+pub enum ShmrsError {
+    /// Failed to acquire a lock within the timeout period.
+    LockTimeout,
+    /// Memory allocation failed during compaction.
+    AllocationFailed,
+    /// System error occurred.
+    SystemError(Errno),
+}

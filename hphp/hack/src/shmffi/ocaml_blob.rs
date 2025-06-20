@@ -3,6 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the "hack" directory of this source tree.
 
+use std::alloc::Layout;
 use std::ptr::NonNull;
 
 use lz4::liblz4;
@@ -164,6 +165,14 @@ impl CMapValue for HeapValue {
 
     fn ptr(&self) -> &NonNull<u8> {
         &self.data
+    }
+
+    unsafe fn set_ptr(&mut self, ptr: NonNull<u8>) {
+        self.data = ptr;
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::from_size_align(self.header.buffer_size(), 1).unwrap()
     }
 }
 

@@ -201,6 +201,7 @@ extern value shmffi_mem_status(uint64_t hash);
 extern value shmffi_get_size(uint64_t hash);
 extern void shmffi_move(uint64_t hash1, uint64_t hash2);
 extern value shmffi_remove(uint64_t hash);
+extern void shmffi_compact(void);
 extern value shmffi_allocated_bytes();
 extern value shmffi_num_entries();
 
@@ -1087,6 +1088,7 @@ value hh_check_heap_overflow(void) {
 
 CAMLprim value hh_collect(void) {
   if (shm_use_sharded_hashtbl != 0) {
+    shmffi_compact();
     return Val_unit;
   }
 

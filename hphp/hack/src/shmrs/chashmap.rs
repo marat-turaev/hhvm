@@ -81,6 +81,15 @@ pub trait CMapValue {
     /// A hash map value holds a pointer to its corresponding data in the heap.
     /// This function returns that pointer.
     fn ptr(&self) -> &NonNull<u8>;
+
+    /// # Safety
+    /// The new pointer must be valid and point to data that is
+    /// equivalent to the data at the old pointer. The layout of the
+    /// data must also be identical.
+    unsafe fn set_ptr(&mut self, ptr: NonNull<u8>);
+
+    /// Returns the layout of the pointed-to data.
+    fn layout(&self) -> Layout;
 }
 
 /// Represents a lookup for a particular key.
@@ -347,19 +356,159 @@ impl<'shm, K: Hash + Eq, V: CMapValue, S: BuildHasher> CMapRef<'shm, K, V, S> {
         self.maps[shard_index].read(LOCK_TIMEOUT).unwrap()
     }
 
+    /// Perform mark-and-sweep garbage collection on all shards.
+    /// This is the proper garbage collection that mimics the C implementation.
+    pub fn garbage_collect_all_shards(&self)
+    where
+        K: Copy,
+    {
+        for shard_index in 0..NUM_SHARDS {
+            let mut shard = {
+                let map = self.maps[shard_index].write(LOCK_TIMEOUT).unwrap();
+                let alloc_non_evictable = &self.shard_allocs_non_evictable[shard_index];
+                let alloc_evictable = &self.shard_allocs_evictable[shard_index];
+                Shard {
+                    map,
+                    alloc_non_evictable,
+                    alloc_evictable,
+                }
+            };
+            Self::garbage_collect_shard(&mut shard);
+        }
+    }
+    
+    /// Compact all shards, keeping only the entries that satisfy the predicate.
+    /// NOTE: This is the old implementation - use garbage_collect_all_shards() for proper GC.
+    pub fn filter_and_compact_all_shards<P>(&self, mut f: P)
+    where
+        K: Copy,
+        P: FnMut(&K, &mut V) -> bool,
+    {
+        for shard_index in 0..NUM_SHARDS {
+            let mut shard = {
+                let map = self.maps[shard_index].write(LOCK_TIMEOUT).unwrap();
+                let alloc_non_evictable = &self.shard_allocs_non_evictable[shard_index];
+                let alloc_evictable = &self.shard_allocs_evictable[shard_index];
+                Shard {
+                    map,
+                    alloc_non_evictable,
+                    alloc_evictable,
+                }
+            };
+            Self::filter_and_compact(&mut shard, &mut f);
+        }
+    }
+
+    /// Perform mark-and-sweep garbage collection on a single shard.
+    /// This mimics the C implementation's algorithm.
+    fn garbage_collect_shard<'a>(
+        shard: &mut Shard<'shm, 'a, K, V, S>,
+    )
+    where
+        K: Copy,
+    {
+        // Phase 1: Mark all objects in evictable allocator as unreachable
+        if shard.alloc_evictable.mark_all_unreachable().is_err() {
+            // If marking fails, skip this shard
+            return;
+        }
+        
+        // Phase 2: Mark reachable objects (hash table entries are the roots)
+        for (_key, value) in shard.map.iter() {
+            if value.points_to_evictable_data() {
+                // This object is reachable from a hash table root
+                shard.alloc_evictable.mark_as_reachable(value.ptr());
+            }
+        }
+        
+        // Phase 3: Reclaim unreachable allocations by moving them to free list
+        if let Ok(bytes_reclaimed) = shard.alloc_evictable.reclaim_unreachable_allocations() {
+            // Optional: Log the amount of memory reclaimed
+            // println!("GC reclaimed {} bytes", bytes_reclaimed);
+            let _ = bytes_reclaimed; // Suppress unused variable warning
+        }
+        
+        // Phase 4: Remove hash map entries pointing to reclaimed objects
+        Self::remove_garbage_collected_entries(shard);
+    }
+    
+    /// Remove hash map entries that point to garbage collected objects.
+    fn remove_garbage_collected_entries<'a>(
+        shard: &mut Shard<'shm, 'a, K, V, S>,
+    )
+    where
+        K: Copy,
+    {
+        let mut keys_to_remove = Vec::new();
+        
+        // Identify entries pointing to unreachable data
+        for (key, value) in shard.map.iter() {
+            if value.points_to_evictable_data() && 
+               !shard.alloc_evictable.is_data_reachable(value.ptr()) {
+                keys_to_remove.push(*key);
+            }
+        }
+        
+        // Remove garbage collected entries
+        for key in keys_to_remove {
+            shard.map.remove(&key);
+        }
+    }
+    
+    
     /// Remove from the index the ones that don't satisfy the predicate
     /// and compact everything remaining.
+    /// NOTE: This is the old implementation - use garbage_collect_all_shards() for proper GC.
     #[allow(unused)]
-    fn filter_and_compact<'a, P: FnMut(&mut V) -> bool>(
+    fn filter_and_compact<'a, P: FnMut(&K, &mut V) -> bool>(
         shard: &mut Shard<'shm, 'a, K, V, S>,
         mut f: P,
-    ) {
-        let entries_to_invalidate = shard.map.extract_if(|_, value| !f(value));
-        entries_to_invalidate.for_each(|(_, value)| {
-            let data = value.ptr();
-            shard.alloc_evictable.mark_as_unreachable(data)
+    ) where
+        K: Copy,
+    {
+        // Step 1: Collect live entries' data. The map is modified in-place by retain.
+        let mut live_data: Vec<(K, Vec<u8>)> = Vec::new();
+
+        shard.map.retain(|key, value| {
+            if f(key, value) {
+                let layout = value.layout();
+                let data =
+                    unsafe { std::slice::from_raw_parts(value.ptr().as_ptr(), layout.size()) };
+                live_data.push((*key, data.to_vec()));
+                true // Keep it in the map for now
+            } else {
+                false // Remove from map
+            }
         });
-        shard.alloc_evictable.compact()
+
+        // Step 2: Reset the evictable allocator. This invalidates all old pointers
+        // for the entries remaining in the map.
+        unsafe {
+            shard.alloc_evictable.reset();
+        }
+
+        // Step 3: Re-allocate the live entries and update their pointers in the map.
+        for (key, data) in live_data {
+            let layout = Layout::from_size_align(data.len(), 1).unwrap();
+            match shard.alloc_evictable.allocate(layout) {
+                Ok(mut new_ptr) => {
+                    // Copy data to new location.
+                    unsafe {
+                        new_ptr.as_mut().copy_from_slice(&data);
+                    }
+                    // Update the pointer in the map.
+                    if let Some(value) = shard.map.get_mut(&key) {
+                        unsafe {
+                            let raw_ptr = NonNull::new(new_ptr.as_ptr() as *mut u8).unwrap();
+                            value.set_ptr(raw_ptr);
+                        }
+                    }
+                }
+                Err(_) => {
+                    panic!("Failed to re-allocate during compaction");
+                }
+            }
+        }
     }
 
     /// Empty a shard.
@@ -522,6 +671,14 @@ mod integration_tests {
         fn ptr(&self) -> &NonNull<u8> {
             // Since none of the existing unit tests below actually write to
             // memory, we should not invoke this function to attempt accessing it
+            panic!("This method should not be invoked!")
+        }
+
+        unsafe fn set_ptr(&mut self, _ptr: NonNull<u8>) {
+            panic!("This method should not be invoked!")
+        }
+
+        fn layout(&self) -> Layout {
             panic!("This method should not be invoked!")
         }
     }

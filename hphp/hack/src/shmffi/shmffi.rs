@@ -326,6 +326,17 @@ pub extern "C" fn shmffi_remove(hash: u64) -> usize {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn shmffi_compact() {
+    catch_unwind(|| {
+        with(|segment| {
+            // Use proper mark-and-sweep garbage collection instead of copying everything
+            segment.table.garbage_collect_all_shards()
+        });
+        0
+    });
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn shmffi_allocated_bytes() -> usize {
     catch_unwind(|| {
         let bytes = with(|segment| segment.table.allocated_bytes());
