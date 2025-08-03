@@ -103,6 +103,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #include <inttypes.h>
 #include <lz4.h>
@@ -918,7 +919,7 @@ CAMLprim value hh_counter_next(void) {
   if (counter) {
     v = LOCAL(worker_id)->counter;
     if (v % COUNTER_RANGE == 0) {
-      v = __atomic_fetch_add(counter, COUNTER_RANGE, __ATOMIC_RELAXED);
+      v = atomic_fetch_add_explicit((_Atomic(uintptr_t)*)counter, COUNTER_RANGE, memory_order_relaxed);
     }
     ++v;
     LOCAL(worker_id)->counter = v;
@@ -1200,11 +1201,20 @@ static void raise_heap_full(void) {
 /*****************************************************************************/
 
 static heap_entry_t* hh_alloc(hh_header_t header, /*out*/size_t *total_size) {
-  // the size of this allocation needs to be kept in sync with wasted_heap_size
-  // modification in hh_remove
   size_t slot_size = HEAP_ALIGN(Heap_entry_total_size(header));
   *total_size = slot_size;
-  char *chunk = __sync_fetch_and_add(heap, (char*) slot_size);
+
+  char *chunk;
+  char *current_heap;
+  do {
+    current_heap = atomic_load_explicit((_Atomic(char*)*)heap, memory_order_relaxed);
+    chunk = current_heap + slot_size;
+  } while (!atomic_compare_exchange_weak_explicit(
+      (_Atomic(char*)*)heap,
+      &current_heap,
+      chunk,
+      memory_order_release,
+      memory_order_relaxed));
   if (chunk + slot_size > heap_max) {
     raise_heap_full();
   }
@@ -1333,12 +1343,14 @@ static value write_at(unsigned int slot, value data) {
   CAMLparam1(data);
   CAMLlocal1(result);
   result = caml_alloc_tuple(3);
-  // Try to write in a value to indicate that the data is being written.
+  heap_entry_t* expected = NULL;
   if(
-     __sync_bool_compare_and_swap(
-       &(hashtbl[slot].addr),
-       NULL,
-       HASHTBL_WRITE_IN_PROGRESS
+    atomic_compare_exchange_strong_explicit(
+       (_Atomic(heap_entry_t*)*)&(hashtbl[slot].addr),
+       &expected,
+       HASHTBL_WRITE_IN_PROGRESS,
+       memory_order_acq_rel,
+       memory_order_acquire
      )
   ) {
     assert_allow_hashtable_writes_by_current_process();
@@ -1349,7 +1361,7 @@ static value write_at(unsigned int slot, value data) {
     Store_field(result, 0, Val_long(alloc_size));
     Store_field(result, 1, Val_long(orig_size));
     Store_field(result, 2, Val_long(total_size));
-    __sync_fetch_and_add(hcounter_filled, 1);
+    atomic_fetch_add_explicit((_Atomic(uint64_t)*)hcounter_filled, 1, memory_order_relaxed);
   } else {
     Store_field(result, 0, Min_long);
     Store_field(result, 1, Min_long);
@@ -1400,8 +1412,9 @@ value hh_add(value evictable, value key, value data) {
 
     if(slot_hash == 0) {
       // We think we might have a free slot, try to atomically grab it.
-      if(__sync_bool_compare_and_swap(&(hashtbl[slot].hash), 0, hash)) {
-        uint64_t size = __sync_fetch_and_add(hcounter, 1);
+      uint64_t expected = 0;
+      if(atomic_compare_exchange_strong_explicit((_Atomic(uint64_t)*)&(hashtbl[slot].hash), &expected, hash, memory_order_acq_rel, memory_order_acquire)) {
+        uint64_t size = atomic_fetch_add_explicit((_Atomic(uint64_t)*)hcounter, 1, memory_order_relaxed);
         // Sanity check
         assert(size < hashtbl_size);
         CAMLreturn(write_at(slot, data));
@@ -1461,17 +1474,19 @@ static heap_entry_t* hh_store_raw_entry(
 /*****************************************************************************/
 static value write_raw_at(unsigned int slot, value data) {
   CAMLparam1(data);
-  // Try to write in a value to indicate that the data is being written.
+  heap_entry_t* expected = NULL;
   if(
-     __sync_bool_compare_and_swap(
-       &(hashtbl[slot].addr),
-       NULL,
-       HASHTBL_WRITE_IN_PROGRESS
+    atomic_compare_exchange_strong_explicit(
+       (_Atomic(heap_entry_t*)*)&(hashtbl[slot].addr),
+       &expected,
+       HASHTBL_WRITE_IN_PROGRESS,
+       memory_order_acq_rel,
+       memory_order_acquire
      )
   ) {
     assert_allow_hashtable_writes_by_current_process();
     hashtbl[slot].addr = hh_store_raw_entry(data);
-    __sync_fetch_and_add(hcounter_filled, 1);
+    atomic_fetch_add_explicit((_Atomic(uint64_t)*)hcounter_filled, 1, memory_order_relaxed);
   }
   CAMLreturn(Val_unit);
 }
@@ -1647,7 +1662,7 @@ void hh_move(value key1, value key2) {
   // hcounter_filled doesn't change, since slot1 becomes empty and slot2 becomes
   // filled.
   if (hashtbl[slot2].hash == 0) {
-    __sync_fetch_and_add(hcounter, 1);
+    atomic_fetch_add_explicit((_Atomic(uint64_t)*)hcounter, 1, memory_order_relaxed);
   }
   hashtbl[slot2].hash = get_hash(key2);
   hashtbl[slot2].addr = hashtbl[slot1].addr;
@@ -1675,10 +1690,10 @@ CAMLprim value hh_remove(value key) {
   // see hh_alloc for the source of this size
   size_t slot_size =
     HEAP_ALIGN(Heap_entry_total_size(hashtbl[slot].addr->header));
-  __sync_fetch_and_add(wasted_heap_size, slot_size);
+  atomic_fetch_add_explicit((_Atomic(size_t)*)wasted_heap_size, slot_size, memory_order_relaxed);
   hashtbl[slot].addr = NULL;
   removed_count += 1;
-  __sync_fetch_and_sub(hcounter_filled, 1);
+  atomic_fetch_sub_explicit((_Atomic(uint64_t)*)hcounter_filled, 1, memory_order_relaxed);
   CAMLreturn(Val_long(entry_size));
 }
 
