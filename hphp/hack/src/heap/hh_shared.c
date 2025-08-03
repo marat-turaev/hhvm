@@ -104,6 +104,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <threads.h>
 
 #include <inttypes.h>
 #include <lz4.h>
@@ -1523,11 +1524,7 @@ static _Bool hh_is_slot_taken_for_key(unsigned int slot, value key) {
     // actually is ready to be used before returning.
     time_t start = 0;
     while (hashtbl[slot].addr == HASHTBL_WRITE_IN_PROGRESS) {
-#if defined(__aarch64__)
-      asm volatile("yield" : : : "memory");
-#else
-      asm volatile("pause" : : : "memory");
-#endif
+      thrd_yield();
       // if the worker writing the data dies, we can get stuck. Timeout check
       // to prevent it.
       time_t now = time(0);
