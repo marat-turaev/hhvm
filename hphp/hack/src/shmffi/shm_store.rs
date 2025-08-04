@@ -27,6 +27,25 @@ use std::num::NonZeroUsize;
 use std::cell::RefCell;
 use zstd::stream::raw::{DCtx, Decoder as RawDecoder, InBuffer, OutBuffer};
 
+/// External C dictionary data from dictionary_data.h
+extern "C" {
+    static dictionary_data: *const u8;
+    static dictionary_data_len: u32;
+}
+
+/// Get ZSTD dictionary data from C implementation
+fn get_dictionary_data() -> &'static [u8] {
+    unsafe {
+        std::slice::from_raw_parts(dictionary_data, dictionary_data_len as usize)
+    }
+}
+
+/// Thread-local ZSTD dictionaries for reuse
+thread_local! {
+    static ZSTD_CDICT: RefCell<Option<(i32, zstd::dict::EncoderDictionary<'static>)>> = RefCell::new(None);
+    static ZSTD_DDICT: RefCell<Option<zstd::dict::DecoderDictionary<'static>>> = RefCell::new(None);
+}
+
 thread_local! {
     static ZSTD_CCTX: RefCell<Option<(i32, zstd::stream::raw::CCtx<'static>)>> = RefCell::new(None);
     static ZSTD_DCTX: RefCell<Option<zstd::stream::raw::DCtx<'static>>> = RefCell::new(None);
@@ -666,89 +685,56 @@ fn lz4_decompress(compressed: &[u8], uncompressed_size: usize) -> Result<Vec<u8>
 }
 
 fn zstd_compress(bytes: &[u8], level: i32) -> Result<Vec<u8>> {
-    ZSTD_CCTX.with(|cctx_cell| {
-        let mut cctx_opt = cctx_cell.borrow_mut();
-
-        // Reuse compression context if level matches, otherwise create new
-        let cctx = match cctx_opt.take() {
-            Some((stored_level, cctx)) if stored_level == level => cctx,
-            _ => {
-                let mut new_cctx = zstd::stream::raw::CCtx::create();
-                new_cctx.set_parameter(zstd::stream::raw::CParameter::CompressionLevel(level))?;
-                new_cctx
+    // Get or create dictionary for this compression level
+    let dict = ZSTD_CDICT.with(|cdict_cell| {
+        let mut cdict_opt = cdict_cell.borrow_mut();
+        match cdict_opt.take() {
+            Some((stored_level, dict)) if stored_level == level => {
+                let result = dict.clone();
+                *cdict_opt = Some((stored_level, dict));
+                result
             }
-        };
+            _ => {
+                let dict = zstd::dict::EncoderDictionary::copy(get_dictionary_data(), level);
+                *cdict_opt = Some((level, dict.clone()));
+                dict
+            }
+        }
+    });
 
-        // Create encoder with reusable context
-        let mut output = Vec::new();
-        let mut encoder = zstd::stream::write::Encoder::with_context(&mut output, cctx)?;
+    // Compress using dictionary
+    let mut output = Vec::new();
+    let mut encoder = zstd::Encoder::with_prepared_dictionary(&mut output, &dict)?;
+    encoder.write_all(bytes)?;
+    encoder.finish()?;
 
-        // Compress data
-        encoder.write_all(bytes)?;
-        let cctx = encoder.finish()?;
-
-        // Store context for reuse
-        *cctx_opt = Some((level, cctx));
-
-        Ok(output)
-    })
+    Ok(output)
 }
 
 fn zstd_decompress(compressed: &[u8]) -> Result<Vec<u8>> {
-    ZSTD_DCTX.with(|dctx_cell| {
-        let mut dctx_opt = dctx_cell.borrow_mut();
-
-        // Reuse decompression context
-        let mut dctx = match dctx_opt.take() {
-            Some(dctx) => dctx,
-            None => zstd::stream::raw::DCtx::create(),
-        };
-
-        // Estimate output size (typically 2-4x compressed size for text data)
-        let estimated_size = compressed.len().saturating_mul(4).max(1024);
-        let mut output = vec![0u8; estimated_size];
-        
-        let mut decoder = RawDecoder::with_context(&mut dctx);
-        let mut in_buf = InBuffer::around(compressed);
-        let mut total_written = 0;
-        
-        // Loop until decompression is complete
-        loop {
-            // Ensure we have output space
-            if total_written >= output.len() {
-                output.resize(output.len().saturating_mul(2), 0);
+    // Get or create decompression dictionary
+    let dict = ZSTD_DDICT.with(|ddict_cell| {
+        let mut ddict_opt = ddict_cell.borrow_mut();
+        match ddict_opt.take() {
+            Some(dict) => {
+                let result = dict.clone();
+                *ddict_opt = Some(dict);
+                result
             }
-            
-            let mut out_buf = OutBuffer::around(&mut output[total_written..]);
-            let bytes_read = decoder.run(&mut in_buf, &mut out_buf)?;
-            total_written += out_buf.pos();
-            
-            if bytes_read == 0 {
-                break; // Decompression complete
+            None => {
+                let dict = zstd::dict::DecoderDictionary::copy(get_dictionary_data());
+                *ddict_opt = Some(dict.clone());
+                dict
             }
         }
-        
-        // Final finish call with remaining output space
-        if total_written < output.len() {
-            let mut out_buf = OutBuffer::around(&mut output[total_written..]);
-            decoder.finish(&mut out_buf, true)?;
-            total_written += out_buf.pos();
-        } else {
-            // Need more space for finish
-            output.resize(output.len() + 64, 0);
-            let mut out_buf = OutBuffer::around(&mut output[total_written..]);
-            decoder.finish(&mut out_buf, true)?;
-            total_written += out_buf.pos();
-        }
-        
-        // Resize to actual output size
-        output.truncate(total_written);
-        
-        // Store context for reuse
-        *dctx_opt = Some(dctx);
+    });
 
-        Ok(output)
-    })
+    // Decompress using dictionary
+    let mut output = Vec::new();
+    let mut decoder = zstd::Decoder::with_prepared_dictionary(compressed, &dict)?;
+    std::io::Read::read_to_end(&mut decoder, &mut output)?;
+
+    Ok(output)
 }
 
 impl<K, V> std::fmt::Debug for OcamlShmStore<K, V> {
